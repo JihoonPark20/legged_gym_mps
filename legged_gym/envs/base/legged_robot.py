@@ -85,13 +85,13 @@ class LeggedRobot(BaseTask):
         """
         clip_actions = self.cfg.normalization.clip_actions
         self.actions = torch.clip(actions, -clip_actions, clip_actions).to(self.device)
-        # step physics and render each frame
-
         
         for _ in range(self.cfg.control.decimation):
             self._apply_action(self.actions)
-            self.scene.step()
-
+            update_visualizer = self.show_viewer and not self.headless
+            self.scene.step(update_visualizer=update_visualizer)
+            if update_visualizer:
+                self.render()
 
         self.post_physics_step()
 
@@ -100,9 +100,8 @@ class LeggedRobot(BaseTask):
         self.obs_buf = torch.clip(self.obs_buf, -clip_obs, clip_obs)
         if self.privileged_obs_buf is not None:
             self.privileged_obs_buf = torch.clip(self.privileged_obs_buf, -clip_obs, clip_obs)
-
-            
         return self.obs_buf, self.privileged_obs_buf, self.rew_buf, self.reset_buf, self.extras
+
     def update_buffer(self):
         self.base_pos[:] = self.robot.get_pos()
         self.base_quat[:] = self.robot.get_quat()
@@ -129,22 +128,15 @@ class LeggedRobot(BaseTask):
         self.last_dof_vel[:] = self.dof_vel[:]
         self.last_root_vel[:] = self.root_states[:, 7:13]
 
-
     def post_physics_step(self):
         """ check terminations, compute observations and rewards
             calls self._post_physics_step_callback() for common computations 
             calls self._draw_debug_vis() if needed
         """
-        # self.gym.refresh_actor_root_state_tensor(self.sim)
-        # self.gym.refresh_net_contact_force_tensor(self.sim)
-        
-        
-        
         self.episode_length_buf += 1
         self.common_step_counter += 1
 
         # prepare quantities
-
         self.update_buffer()
         self._post_physics_step_callback()
 
@@ -154,8 +146,6 @@ class LeggedRobot(BaseTask):
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         self.reset_idx(env_ids)
         self.compute_observations() # in some cases a simulation step might be required to refresh some obs (for example body positions)
-
-
 
         if self.viewer and self.enable_viewer_sync and self.debug_viz:
             self._draw_debug_vis()
@@ -296,6 +286,14 @@ class LeggedRobot(BaseTask):
         elif mesh_type is not None:
             raise ValueError("Terrain mesh type not recognised. Allowed types are [None, plane, heightfield, trimesh]")
         self._create_envs()
+        
+        # On macOS, viewer may not be created even if show_viewer=True
+        # Check if viewer was actually created and disable if not
+        if self.show_viewer and not self.headless:
+            import sys
+            if sys.platform == 'darwin':
+                if not hasattr(self.scene, 'viewer') or self.scene.viewer is None:
+                    self.show_viewer = False
 
     def set_camera(self, position, lookat):
         """ Set camera position and direction
@@ -477,34 +475,11 @@ class LeggedRobot(BaseTask):
         Args:
             env_ids (List[int]): Environemnt ids
         """
-        # base position
-        # if self.custom_origins:
-        #     self.root_states[env_ids] = self.base_init_state
-        #     self.root_states[env_ids, :3] += self.env_origins[env_ids]
-        #     self.root_states[env_ids, :2] += torch_rand_float(-1., 1., (len(env_ids), 2), device=self.device) # xy position within 1m of the center
-        # else:
-        #     self.root_states[env_ids] = self.base_init_state
-        #     self.root_states[env_ids, :3] += self.env_origins[env_ids]
-        # # base velocities
-        # self.root_states[env_ids, 7:13] = torch_rand_float(-0.5, 0.5, (len(env_ids), 6), device=self.device) # [7:10]: lin vel, [10:13]: ang vel
-        # env_ids_int32 = env_ids.to(dtype=torch.int32)
-        # self.gym.set_actor_root_state_tensor_indexed(self.sim,
-        #                                              gymtorch.unwrap_tensor(self.root_states),
-        #                                              gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
         self.base_pos[env_ids] = self.base_init_pos
         self.base_pos[env_ids, :2] += torch_rand_float(
             -1.0, 1.0, (len( env_ids), 2), str(self.device)
         )
         self.base_quat[env_ids] = self.base_init_quat.reshape(1, -1)
-        # base_euler = torch_rand_float(
-        #     -0.1, 0.1, (len( env_ids), 3), self.device
-        # )
-        # base_euler[:, 2:3] = torch_rand_float(0.0, 3.14, (len( env_ids),1), self.device)
-        # self.base_quat[env_ids] = quat_mul(
-        #     quat_from_euler_xyz(base_euler[:,0],base_euler[:,1],base_euler[:,2]),
-        #     self.base_quat[ env_ids],
-        # )
-
 
         self.robot.set_pos(
             self.base_pos[ env_ids], zero_velocity=False,  envs_idx= env_ids
@@ -513,8 +488,6 @@ class LeggedRobot(BaseTask):
             self.base_quat[ env_ids], zero_velocity=False,  envs_idx= env_ids
         )
         self.robot.zero_all_dofs_velocity( env_ids)
-
-
 
     def _push_robots(self):
         """ Random pushes the robots. Emulates an impulse by setting a randomized base velocity. 
@@ -556,7 +529,6 @@ class LeggedRobot(BaseTask):
             self.command_ranges["lin_vel_x"][0] = np.clip(self.command_ranges["lin_vel_x"][0] - 0.5, -self.cfg.commands.max_curriculum, 0.)
             self.command_ranges["lin_vel_x"][1] = np.clip(self.command_ranges["lin_vel_x"][1] + 0.5, 0., self.cfg.commands.max_curriculum)
 
-
     def _get_noise_scale_vec(self, cfg):
         """ Sets a vector used to scale the noise added to the observations.
             [NOTE]: Must be adapted when changing the observations structure
@@ -586,8 +558,6 @@ class LeggedRobot(BaseTask):
     def _init_buffers(self):
         """ Initialize torch tensors which will contain simulation states and processed quantities
         """
-
-        # self.gym.refresh_net_contact_force_tensor(self.sim)
         self.base_pos = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float)
         self.base_quat = torch.zeros((self.num_envs, 4), device=self.device, dtype=torch.float)
         self.base_lin_vel = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float)
@@ -621,10 +591,6 @@ class LeggedRobot(BaseTask):
         
         self.feet_air_time = torch.zeros(self.num_envs, self.feet_indices.shape[0], dtype=torch.float, device=self.device, requires_grad=False)
         self.last_contacts = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
-        
-        
-
-
 
         self.base_pos[:] = self.robot.get_pos()
         self.base_quat[:] = self.robot.get_quat()
@@ -765,8 +731,6 @@ class LeggedRobot(BaseTask):
         self.num_dofs = len(self.dof_names) #minux base joint 
         self.num_dof = self.num_dofs
         
-        
-        
         body_names=[]
         self.links_obj = self.robot.links
         self.body_names = [link.name for link in self.links_obj]
@@ -829,8 +793,6 @@ class LeggedRobot(BaseTask):
             self.termination_contact_indices_world_frame[index] = self.robot.get_link(name).idx
             index = index + 1
 
-    
-
     def find_link_indices(self,names):
         link_indices = list()
         for link in self.robot.links:
@@ -842,6 +804,7 @@ class LeggedRobot(BaseTask):
                 link_indices.append(link.idx - self.robot.link_start)
 
         return link_indices
+        
     def _parse_cfg(self, cfg):
         print("self.sim_params.sim: ", self.sim_params["sim"])
         self.dt = self.cfg.control.decimation * self.sim_params["sim"]["dt"]
@@ -1010,10 +973,12 @@ class LeggedRobot(BaseTask):
         rew_airTime *= torch.norm(self.commands[:, :2], dim=1) > 0.1 #no reward for zero command
         self.feet_air_time *= ~contact_filt
         return rew_airTime
+
     def _reward_no_fly(self):
         contacts = self.contact_forces[:, self.feet_indices, 2] > 0.1
         single_contact = torch.sum(1. * contacts, dim=1) == 1
         return 1. * single_contact
+
     def _reward_feet_contact_forces(self):
         # penalize high contact forces
         return torch.sum((torch.norm(self.contact_forces[:, self.feet_indices, :],

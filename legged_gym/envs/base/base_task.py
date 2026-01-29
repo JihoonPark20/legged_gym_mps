@@ -40,31 +40,18 @@ from legged_gym.utils import gymutil
 class BaseTask():
 
     def __init__(self, cfg, sim_params, physics_engine, sim_device, headless):
-        #self.gym = gymapi.acquire_gym()
-        
-        #   genesis
-        # create scene
-        
-        if self.headless == False:
+        self.headless = headless
+        if not self.headless:
             self.show_viewer = True
-        else:  # headless
+        else:
             self.show_viewer = False
-        
-
-
-
-       
-        
     
-        
         self.sim_params = sim_params
         self.dt = self.sim_params["sim"]["dt"]
         self.physics_engine = physics_engine
         self.sim_device = sim_device
         
-        
         sim_device_type, self.sim_device_id = gymutil.parse_device_str(self.sim_device)
-        self.headless = headless
 
         if sim_device_type == 'cpu':
             self.device = torch.device('cpu')
@@ -134,27 +121,29 @@ class BaseTask():
         raise NotImplementedError
 
     def render(self, sync_frame_time=True):
-        if self.viewer:
-            # check for window closed
-            if self.gym.query_viewer_has_closed(self.viewer):
-                sys.exit()
-
-            # check for keyboard events
-            for evt in self.gym.query_viewer_action_events(self.viewer):
-                if evt.action == "QUIT" and evt.value > 0:
-                    sys.exit()
-                elif evt.action == "toggle_viewer_sync" and evt.value > 0:
-                    self.enable_viewer_sync = not self.enable_viewer_sync
-
-            # fetch results
-            if self.device.type != 'cpu':
-                self.gym.fetch_results(self.sim, True)
-
-            # step graphics
-            if self.enable_viewer_sync:
-                self.gym.step_graphics(self.sim)
-                self.gym.draw_viewer(self.viewer, self.sim, True)
-                if sync_frame_time:
-                    self.gym.sync_frame_time(self.sim)
-            else:
-                self.gym.poll_viewer_events(self.viewer)
+        """Render the scene using Genesis Scene API.
+        
+        Note: In Genesis, rendering is handled automatically by scene.step() with
+        update_visualizer=True parameter. On macOS, viewer may require separate thread
+        and explicit viewer update calls.
+        
+        Args:
+            sync_frame_time (bool): Whether to sync frame time (for Genesis compatibility, currently unused)
+        """
+        if not hasattr(self, 'scene') or self.scene is None:
+            return
+        
+        if not (self.show_viewer and not self.headless):
+            return
+        
+        try:
+            if hasattr(self.scene, 'viewer') and self.scene.viewer is not None:
+                if hasattr(self.scene.viewer, 'update'):
+                    self.scene.viewer.update()
+                elif hasattr(self.scene.viewer, 'render'):
+                    self.scene.viewer.render()
+            elif hasattr(self.scene, 'visualizer') and self.scene.visualizer is not None:
+                if hasattr(self.scene.visualizer, 'update'):
+                    self.scene.visualizer.update()
+        except Exception as e:
+            pass
