@@ -115,11 +115,15 @@ class LeggedRobot(BaseTask):
         self.projected_gravity = transform_by_quat(self.global_gravity, inv_base_quat)
         self.dof_pos[:] = self.robot.get_dofs_position(self.motor_dofs)
         self.dof_vel[:] = self.robot.get_dofs_velocity(self.motor_dofs)
-        self.contact_forces[:] = torch.tensor(
-            self.robot.get_links_net_contact_force(),
-            device=self.device,
-            dtype=torch.float,
-        )
+        contact_forces_data = self.robot.get_links_net_contact_force()
+        if isinstance(contact_forces_data, torch.Tensor):
+            self.contact_forces[:] = contact_forces_data.to(device=self.device, dtype=torch.float)
+        else:
+            self.contact_forces[:] = torch.tensor(
+                contact_forces_data,
+                device=self.device,
+                dtype=torch.float,
+            )
         self.root_states = torch.cat((self.base_pos[:], self.base_quat[:], self.base_lin_vel[:], self.base_ang_vel[:]), dim=-1)
         self.last_actions[:] = self.actions[:]
         self.last_dof_vel[:] = self.dof_vel[:]

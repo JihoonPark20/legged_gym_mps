@@ -11,13 +11,20 @@ license agreement from NVIDIA CORPORATION is strictly prohibited.
 import torch
 import numpy as np
 
+# Check if MPS is available and disable JIT for MPS
+_USE_JIT = not (torch.backends.mps.is_available() if hasattr(torch.backends, 'mps') else False)
+
+def _jit_script_if_enabled(func):
+    """Conditionally apply JIT script decorator based on device support"""
+    if _USE_JIT:
+        return torch.jit.script(func)
+    return func
 
 def to_torch(x, dtype=torch.float, device='mps', requires_grad=False):
     return torch.tensor(x, dtype=dtype, device=device, requires_grad=requires_grad)
 
 
-@torch.jit.script
-def quat_mul(a, b):
+def _quat_mul_impl(a, b):
     assert a.shape == b.shape
     shape = a.shape
     a = a.reshape(-1, 4)
@@ -39,14 +46,14 @@ def quat_mul(a, b):
 
     return quat
 
+quat_mul = _jit_script_if_enabled(_quat_mul_impl)
 
-@torch.jit.script
-def normalize(x, eps: float = 1e-9):
+def _normalize_impl(x, eps: float = 1e-9):
     return x / x.norm(p=2, dim=-1).clamp(min=eps, max=None).unsqueeze(-1)
 
+normalize = _jit_script_if_enabled(_normalize_impl)
 
-@torch.jit.script
-def quat_apply(a, b):
+def _quat_apply_impl(a, b):
     shape = b.shape
     a = a.reshape(-1, 4)
     b = b.reshape(-1, 3)
@@ -54,9 +61,9 @@ def quat_apply(a, b):
     t = xyz.cross(b, dim=-1) * 2
     return (b + a[:, 3:] * t + xyz.cross(t, dim=-1)).view(shape)
 
+quat_apply = _jit_script_if_enabled(_quat_apply_impl)
 
-@torch.jit.script
-def quat_rotate(q, v):
+def _quat_rotate_impl(q, v):
     shape = q.shape
     q_w = q[:, -1]
     q_vec = q[:, :3]
@@ -67,9 +74,9 @@ def quat_rotate(q, v):
             shape[0], 3, 1)).squeeze(-1) * 2.0
     return a + b + c
 
+quat_rotate = _jit_script_if_enabled(_quat_rotate_impl)
 
-@torch.jit.script
-def quat_rotate_inverse(q, v):
+def _quat_rotate_inverse_impl(q, v):
     shape = q.shape
     q_w = q[:, -1]
     q_vec = q[:, :3]
@@ -80,56 +87,58 @@ def quat_rotate_inverse(q, v):
             shape[0], 3, 1)).squeeze(-1) * 2.0
     return a - b + c
 
+quat_rotate_inverse = _jit_script_if_enabled(_quat_rotate_inverse_impl)
 
-@torch.jit.script
-def quat_conjugate(a):
+def _quat_conjugate_impl(a):
     shape = a.shape
     a = a.reshape(-1, 4)
     return torch.cat((-a[:, :3], a[:, -1:]), dim=-1).view(shape)
 
+quat_conjugate = _jit_script_if_enabled(_quat_conjugate_impl)
 
-@torch.jit.script
-def quat_unit(a):
+def _quat_unit_impl(a):
     return normalize(a)
 
+quat_unit = _jit_script_if_enabled(_quat_unit_impl)
 
-@torch.jit.script
-def quat_from_angle_axis(angle, axis):
+def _quat_from_angle_axis_impl(angle, axis):
     theta = (angle / 2).unsqueeze(-1)
     xyz = normalize(axis) * theta.sin()
     w = theta.cos()
     return quat_unit(torch.cat([xyz, w], dim=-1))
 
+quat_from_angle_axis = _jit_script_if_enabled(_quat_from_angle_axis_impl)
 
-@torch.jit.script
-def normalize_angle(x):
+def _normalize_angle_impl(x):
     return torch.atan2(torch.sin(x), torch.cos(x))
 
+normalize_angle = _jit_script_if_enabled(_normalize_angle_impl)
 
-@torch.jit.script
-def tf_inverse(q, t):
+def _tf_inverse_impl(q, t):
     q_inv = quat_conjugate(q)
     return q_inv, -quat_apply(q_inv, t)
 
+tf_inverse = _jit_script_if_enabled(_tf_inverse_impl)
 
-@torch.jit.script
-def tf_apply(q, t, v):
+def _tf_apply_impl(q, t, v):
     return quat_apply(q, v) + t
 
+tf_apply = _jit_script_if_enabled(_tf_apply_impl)
 
-@torch.jit.script
-def tf_vector(q, v):
+def _tf_vector_impl(q, v):
     return quat_apply(q, v)
 
+tf_vector = _jit_script_if_enabled(_tf_vector_impl)
 
-@torch.jit.script
-def tf_combine(q1, t1, q2, t2):
+def _tf_combine_impl(q1, t1, q2, t2):
     return quat_mul(q1, q2), quat_apply(q1, t2) + t1
 
+tf_combine = _jit_script_if_enabled(_tf_combine_impl)
 
-@torch.jit.script
-def get_basis_vector(q, v):
+def _get_basis_vector_impl(q, v):
     return quat_rotate(q, v)
+
+get_basis_vector = _jit_script_if_enabled(_get_basis_vector_impl)
 
 
 def get_axis_params(value, axis_idx, x_value=0., dtype=np.float64, n_dims=3):
@@ -143,15 +152,13 @@ def get_axis_params(value, axis_idx, x_value=0., dtype=np.float64, n_dims=3):
     return list(params.astype(dtype))
 
 
-@torch.jit.script
-def copysign(a, b):
-    # type: (float, Tensor) -> Tensor
-    a = torch.tensor(a, device=b.device, dtype=torch.float).repeat(b.shape[0])
-    return torch.abs(a) * torch.sign(b)
+def _copysign_impl(a, b):
+    a_tensor = torch.tensor(a, device=b.device, dtype=torch.float).repeat(b.shape[0])
+    return torch.abs(a_tensor) * torch.sign(b)
 
+copysign = _jit_script_if_enabled(_copysign_impl)
 
-@torch.jit.script
-def get_euler_xyz(q):
+def _get_euler_xyz_impl(q):
     qx, qy, qz, qw = 0, 1, 2, 3
     # roll (x-axis rotation)
     sinr_cosp = 2.0 * (q[:, qw] * q[:, qx] + q[:, qy] * q[:, qz])
@@ -172,9 +179,9 @@ def get_euler_xyz(q):
 
     return roll % (2*np.pi), pitch % (2*np.pi), yaw % (2*np.pi)
 
+get_euler_xyz = _jit_script_if_enabled(_get_euler_xyz_impl)
 
-@torch.jit.script
-def quat_from_euler_xyz(roll, pitch, yaw):
+def _quat_from_euler_xyz_impl(roll, pitch, yaw):
     cy = torch.cos(yaw * 0.5)
     sy = torch.sin(yaw * 0.5)
     cr = torch.cos(roll * 0.5)
@@ -189,33 +196,33 @@ def quat_from_euler_xyz(roll, pitch, yaw):
 
     return torch.stack([qx, qy, qz, qw], dim=-1)
 
+quat_from_euler_xyz = _jit_script_if_enabled(_quat_from_euler_xyz_impl)
 
-@torch.jit.script
-def torch_rand_float(lower, upper, shape, device):
-    # type: (float, float, Tuple[int, int], str) -> Tensor
+def _torch_rand_float_impl(lower, upper, shape, device):
     return (upper - lower) * torch.rand(*shape, device=device) + lower
 
+torch_rand_float = _jit_script_if_enabled(_torch_rand_float_impl)
 
-@torch.jit.script
-def torch_random_dir_2(shape, device):
-    # type: (Tuple[int, int], str) -> Tensor
+def _torch_random_dir_2_impl(shape, device):
     angle = torch_rand_float(-np.pi, np.pi, shape, device).squeeze(-1)
     return torch.stack([torch.cos(angle), torch.sin(angle)], dim=-1)
 
+torch_random_dir_2 = _jit_script_if_enabled(_torch_random_dir_2_impl)
 
-@torch.jit.script
-def tensor_clamp(t, min_t, max_t):
+def _tensor_clamp_impl(t, min_t, max_t):
     return torch.max(torch.min(t, max_t), min_t)
 
+tensor_clamp = _jit_script_if_enabled(_tensor_clamp_impl)
 
-@torch.jit.script
-def scale(x, lower, upper):
+def _scale_impl(x, lower, upper):
     return (0.5 * (x + 1.0) * (upper - lower) + lower)
 
+scale = _jit_script_if_enabled(_scale_impl)
 
-@torch.jit.script
-def unscale(x, lower, upper):
+def _unscale_impl(x, lower, upper):
     return (2.0 * x - upper - lower) / (upper - lower)
+
+unscale = _jit_script_if_enabled(_unscale_impl)
 
 
 def unscale_np(x, lower, upper):
