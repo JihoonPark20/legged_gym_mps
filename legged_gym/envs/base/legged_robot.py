@@ -55,8 +55,8 @@ class LeggedRobot(BaseTask):
 
         Args:
             cfg (Dict): Environment config file
-            sim_params (gymapi.SimParams): simulation parameters
-            physics_engine (gymapi.SimType): gymapi.SIM_PHYSX (must be PhysX)
+            sim_params (Dict): simulation parameters ({"sim": {...}})
+            physics_engine (string): "genesis"
             device_type (string): 'mps' or 'cpu'
             device_id (int): 0, 1, ...
             headless (bool): Run without rendering if True
@@ -124,9 +124,7 @@ class LeggedRobot(BaseTask):
                 dtype=torch.float,
             )
         self.root_states = torch.cat((self.base_pos[:], self.base_quat[:], self.base_lin_vel[:], self.base_ang_vel[:]), dim=-1)
-        self.last_actions[:] = self.actions[:]
-        self.last_dof_vel[:] = self.dof_vel[:]
-        self.last_root_vel[:] = self.root_states[:, 7:13]
+        self.torques[:] = self.robot.get_dofs_control_force(self.motor_dofs)
 
     def post_physics_step(self):
         """ check terminations, compute observations and rewards
@@ -147,8 +145,11 @@ class LeggedRobot(BaseTask):
         self.reset_idx(env_ids)
         self.compute_observations() # in some cases a simulation step might be required to refresh some obs (for example body positions)
 
-        if self.viewer and self.enable_viewer_sync and self.debug_viz:
-            self._draw_debug_vis()
+        # update last_* buffers only after rewards/observations are computed,
+        # otherwise action_rate and dof_acc penalties are always zero
+        self.last_actions[:] = self.actions[:]
+        self.last_dof_vel[:] = self.dof_vel[:]
+        self.last_root_vel[:] = self.root_states[:, 7:13]
 
     def check_termination(self):
         """ Check if environments need to be reset
@@ -254,16 +255,16 @@ class LeggedRobot(BaseTask):
             if "already initialized" not in str(e):
                 raise
         self.scene = gs.Scene(
-            sim_options=gs.options.SimOptions(dt=self.dt, substeps=2),
+            sim_options=gs.options.SimOptions(dt=self.sim_dt, substeps=2),
             viewer_options=gs.options.ViewerOptions(
-                max_FPS=int(0.5 / self.dt),
+                max_FPS=int(0.5 / self.sim_dt),
                 camera_pos=(2.0, 0.0, 2.5),
                 camera_lookat=(0.0, 0.0, 0.5),
                 camera_fov=40,
             ),
             vis_options=gs.options.VisOptions(n_rendered_envs=1),
             rigid_options=gs.options.RigidOptions(
-                dt=self.dt,
+                dt=self.sim_dt,
                 constraint_solver=gs.constraint_solver.Newton,
                 enable_collision=True,
                 enable_joint_limit=True,
@@ -273,16 +274,9 @@ class LeggedRobot(BaseTask):
         #create ground
         if mesh_type in ['heightfield', 'trimesh']:
             raise NotImplementedError("Heightfield and trimesh terrains are not yet supported")
-            #self.terrain = Terrain(self.cfg.terrain, self.num_envs)
         if mesh_type=='plane':
             envs_asset_path = LEGGED_GYM_ROOT_DIR+"/resources/envs/plane/plane.urdf"
             self.scene.add_entity(gs.morphs.URDF(file=envs_asset_path, fixed=True))
-        elif mesh_type=='heightfield':
-            pass
-            #self._create_heightfield()
-        elif mesh_type=='trimesh':
-            pass
-            #self._create_trimesh()
         elif mesh_type is not None:
             raise ValueError("Terrain mesh type not recognised. Allowed types are [None, plane, heightfield, trimesh]")
         self._create_envs()
@@ -295,38 +289,29 @@ class LeggedRobot(BaseTask):
                 if not hasattr(self.scene, 'viewer') or self.scene.viewer is None:
                     self.show_viewer = False
 
-    def set_camera(self, position, lookat):
-        """ Set camera position and direction
-        """
-        cam_pos = gymapi.Vec3(position[0], position[1], position[2])
-        cam_target = gymapi.Vec3(lookat[0], lookat[1], lookat[2])
-        self.gym.viewer_camera_look_at(self.viewer, None, cam_pos, cam_target)
-
     #------------- Callbacks --------------
-    def _process_rigid_shape_props(self, props, env_id):
-        """ Callback allowing to store/change/randomize the rigid shape properties of each environment.
-            Called During environment creation.
-            Base behavior: randomizes the friction of each environment
-
-        Args:
-            props (List[gymapi.RigidShapeProperties]): Properties of each shape of the asset
-            env_id (int): Environment id
-
-        Returns:
-            [List[gymapi.RigidShapeProperties]]: Modified rigid shape properties
+    def _randomize_friction(self):
+        """ Randomizes the friction of each environment using the Genesis friction-ratio API.
+            Called once during environment creation (after scene.build).
         """
-        if self.cfg.domain_rand.randomize_friction:
-            if env_id==0:
-                # prepare friction randomization
-                friction_range = self.cfg.domain_rand.friction_range
-                num_buckets = 64
-                bucket_ids = torch.randint(0, num_buckets, (self.num_envs, 1))
-                friction_buckets = torch_rand_float(friction_range[0], friction_range[1], (num_buckets,1), device='cpu')
-                self.friction_coeffs = friction_buckets[bucket_ids]
-
-            for s in range(len(props)):
-                props[s].friction = self.friction_coeffs[env_id]
-        return props
+        if not self.cfg.domain_rand.randomize_friction:
+            return
+        friction_range = self.cfg.domain_rand.friction_range
+        envs_idx = np.arange(0, self.num_envs)
+        # genesis 0.2.0 set_friction_ratio cannot handle links with different
+        # geom counts in a single call -> set one link at a time
+        for link in self.robot.links:
+            if link.n_geoms == 0:
+                continue
+            friction_ratio = torch_rand_float(
+                friction_range[0], friction_range[1],
+                (self.num_envs, 1), device=str(self.device),
+            )
+            self.robot.set_friction_ratio(
+                friction_ratio=friction_ratio,
+                link_indices=[link.idx_local],
+                envs_idx=envs_idx,
+            )
 
     def _process_dof_props(self):
         """ Callback allowing to store/change/randomize the DOF properties of each environment.
@@ -378,19 +363,6 @@ class LeggedRobot(BaseTask):
 
         self.torque_limits = self.robot.get_dofs_force_range(self.motor_dofs)[1]
 
-    def _process_rigid_body_props(self, props, env_id):
-        # if env_id==0:
-        #     sum = 0
-        #     for i, p in enumerate(props):
-        #         sum += p.mass
-        #         print(f"Mass of body {i}: {p.mass} (before randomization)")
-        #     print(f"Total mass {sum} (before randomization)")
-        # randomize base mass
-        if self.cfg.domain_rand.randomize_base_mass:
-            rng = self.cfg.domain_rand.added_mass_range
-            props[0].mass += np.random.uniform(rng[0], rng[1])
-        return props
-    
     def _post_physics_step_callback(self):
         """ Callback called before computing terminations, rewards, and observations
             Default behaviour: Compute ang vel command based on target and heading, compute measured terrain heights and randomly push robots
@@ -399,7 +371,8 @@ class LeggedRobot(BaseTask):
         env_ids = (self.episode_length_buf % int(self.cfg.commands.resampling_time / self.dt)==0).nonzero(as_tuple=False).flatten()
         self._resample_commands(env_ids)
         if self.cfg.commands.heading_command:
-            forward = quat_apply(self.base_quat, self.forward_vec)
+            # base_quat follows the Genesis w,x,y,z convention -> use Genesis geom utils
+            forward = transform_by_quat(self.forward_vec, self.base_quat)
             heading = torch.atan2(forward[:, 1], forward[:, 0])
             self.commands[:, 2] = torch.clip(0.5*wrap_to_pi(self.commands[:, 3] - heading), -1., 1.)
 
@@ -488,13 +461,6 @@ class LeggedRobot(BaseTask):
             self.base_quat[ env_ids], zero_velocity=False,  envs_idx= env_ids
         )
         self.robot.zero_all_dofs_velocity( env_ids)
-
-    def _push_robots(self):
-        """ Random pushes the robots. Emulates an impulse by setting a randomized base velocity. 
-        """
-        max_vel = self.cfg.domain_rand.max_push_vel_xy
-        self.root_states[:, 7:9] = torch_rand_float(-max_vel, max_vel, (self.num_envs, 2), device=str(self.device)) # lin vel x/y
-        self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_states))
 
     def _update_terrain_curriculum(self, env_ids):
         """ Implements the game-inspired curriculum.
@@ -644,51 +610,6 @@ class LeggedRobot(BaseTask):
         self.episode_sums = {name: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
                              for name in self.reward_scales.keys()}
 
-    def _create_ground_plane(self):
-        """ Adds a ground plane to the simulation, sets friction and restitution based on the cfg.
-        """
-        plane_params = gymapi.PlaneParams()
-        plane_params.normal = gymapi.Vec3(0.0, 0.0, 1.0)
-        plane_params.static_friction = self.cfg.terrain.static_friction
-        plane_params.dynamic_friction = self.cfg.terrain.dynamic_friction
-        plane_params.restitution = self.cfg.terrain.restitution
-        self.gym.add_ground(self.sim, plane_params)
-    
-    def _create_heightfield(self):
-        """ Adds a heightfield terrain to the simulation, sets parameters based on the cfg.
-        """
-        hf_params = gymapi.HeightFieldParams()
-        hf_params.column_scale = self.terrain.cfg.horizontal_scale
-        hf_params.row_scale = self.terrain.cfg.horizontal_scale
-        hf_params.vertical_scale = self.terrain.cfg.vertical_scale
-        hf_params.nbRows = self.terrain.tot_cols
-        hf_params.nbColumns = self.terrain.tot_rows 
-        hf_params.transform.p.x = -self.terrain.cfg.border_size 
-        hf_params.transform.p.y = -self.terrain.cfg.border_size
-        hf_params.transform.p.z = 0.0
-        hf_params.static_friction = self.cfg.terrain.static_friction
-        hf_params.dynamic_friction = self.cfg.terrain.dynamic_friction
-        hf_params.restitution = self.cfg.terrain.restitution
-
-        self.gym.add_heightfield(self.sim, self.terrain.heightsamples, hf_params)
-        self.height_samples = torch.tensor(self.terrain.heightsamples).view(self.terrain.tot_rows, self.terrain.tot_cols).to(self.device)
-
-    def _create_trimesh(self):
-        """ Adds a triangle mesh terrain to the simulation, sets parameters based on the cfg.
-        # """
-        tm_params = gymapi.TriangleMeshParams()
-        tm_params.nb_vertices = self.terrain.vertices.shape[0]
-        tm_params.nb_triangles = self.terrain.triangles.shape[0]
-
-        tm_params.transform.p.x = -self.terrain.cfg.border_size 
-        tm_params.transform.p.y = -self.terrain.cfg.border_size
-        tm_params.transform.p.z = 0.0
-        tm_params.static_friction = self.cfg.terrain.static_friction
-        tm_params.dynamic_friction = self.cfg.terrain.dynamic_friction
-        tm_params.restitution = self.cfg.terrain.restitution
-        self.gym.add_triangle_mesh(self.sim, self.terrain.vertices.flatten(order='C'), self.terrain.triangles.flatten(order='C'), tm_params)   
-        self.height_samples = torch.tensor(self.terrain.heightsamples).view(self.terrain.tot_rows, self.terrain.tot_cols).to(self.device)
-
     def _create_envs(self):
         """ Creates environments:
              1. loads the robot URDF/MJCF asset,
@@ -793,6 +714,8 @@ class LeggedRobot(BaseTask):
             self.termination_contact_indices_world_frame[index] = self.robot.get_link(name).idx
             index = index + 1
 
+        self._randomize_friction()
+
     def find_link_indices(self,names):
         link_indices = list()
         for link in self.robot.links:
@@ -817,27 +740,6 @@ class LeggedRobot(BaseTask):
         self.max_episode_length = np.ceil(self.max_episode_length_s / self.dt)
 
         self.cfg.domain_rand.push_interval = np.ceil(self.cfg.domain_rand.push_interval_s / self.dt)
-
-    def _draw_debug_vis(self):
-        """ Draws visualizations for dubugging (slows down simulation a lot).
-            Default behaviour: draws height measurement points
-        """
-        # draw height lines
-        if not self.terrain.cfg.measure_heights:
-            return
-        self.gym.clear_lines(self.viewer)
-        self.gym.refresh_rigid_body_state_tensor(self.sim)
-        sphere_geom = gymutil.WireframeSphereGeometry(0.02, 4, 4, None, color=(1, 1, 0))
-        for i in range(self.num_envs):
-            base_pos = (self.root_states[i, :3]).cpu().numpy()
-            heights = self.measured_heights[i].cpu().numpy()
-            height_points = quat_apply_yaw(self.base_quat[i].repeat(heights.shape[0]), self.height_points[i]).cpu().numpy()
-            for j in range(heights.shape[0]):
-                x = height_points[j, 0] + base_pos[0]
-                y = height_points[j, 1] + base_pos[1]
-                z = heights[j]
-                sphere_pose = gymapi.Transform(gymapi.Vec3(x, y, z), r=None)
-                gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose) 
 
     def _init_height_points(self):
         """ Returns points at which the height measurments are sampled (in base frame)

@@ -31,7 +31,6 @@
 import sys
 import numpy as np
 import torch
-import torch
 import math
 import genesis as gs
 from genesis.utils.geom import quat_to_xyz, transform_by_quat, inv_quat, transform_quat_by_quat
@@ -47,7 +46,9 @@ class BaseTask():
             self.show_viewer = False
     
         self.sim_params = sim_params
-        self.dt = self.sim_params["sim"]["dt"]
+        # simulation (physics) timestep; the policy timestep self.dt (= decimation * sim_dt)
+        # is set by LeggedRobot._parse_cfg() and must not be overwritten here
+        self.sim_dt = self.sim_params["sim"]["dt"]
         self.physics_engine = physics_engine
         self.sim_device = sim_device
         
