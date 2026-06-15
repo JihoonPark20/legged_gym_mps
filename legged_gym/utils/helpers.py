@@ -137,6 +137,13 @@ def get_args():
         {"name": "--num_envs", "type": int, "help": "Number of environments to create. Overrides config file if provided."},
         {"name": "--seed", "type": int, "help": "Random seed. Overrides config file if provided."},
         {"name": "--max_iterations", "type": int, "help": "Maximum number of training iterations. Overrides config file if provided."},
+
+        # --- W&B sweep parameters (used by scripts/sweep.py) ---
+        {"name": "--wandb_project", "type": str, "default": "legged_gym_sweep", "help": "W&B project name for sweeps/logging."},
+        {"name": "--wandb_entity", "type": str, "default": None, "help": "W&B entity (team/user). Defaults to your default entity."},
+        {"name": "--sweep_id", "type": str, "default": None, "help": "Attach an agent to an existing sweep id instead of creating a new sweep."},
+        {"name": "--sweep_count", "type": int, "default": 1, "help": "Number of runs this sweep agent will execute before exiting."},
+        {"name": "--sweep_config", "type": str, "default": None, "help": "Path to the sweep YAML. Defaults to scripts/sweep_config.yaml."},
     ]
     # parse arguments
     args = gymutil.parse_arguments(

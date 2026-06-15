@@ -11,5 +11,7 @@ setup(
     description='Isaac Gym environments for Legged Robots',
     install_requires=[
                       'rsl-rl',
-                      'matplotlib']
+                      'matplotlib',
+                      'wandb',
+                      'pyyaml']
 )

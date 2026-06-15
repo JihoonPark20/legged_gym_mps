@@ -1,0 +1,65 @@
+# W&B Sweep 설정 파일
+# ------------------------------------------------------------------
+# 사용법:
+#   python legged_gym/scripts/sweep.py --task go2 --headless --max_iterations 500
+#
+# - parameters 의 key 는 학습 config 의 "점(.)으로 구분된 경로" 입니다.
+#   * algorithm.*, policy.*, runner.*  -> train_cfg (LeggedRobotCfgPPO)
+#   * 그 외 (rewards.*, control.*, env.* 등)  -> env_cfg (LeggedRobotCfg)
+#   * 보상 스케일은 rewards.scales.<name> 처럼 깊은 경로도 지원합니다.
+# - metric.name 은 rsl_rl 이 TensorBoard 에 기록하는 태그와 동일해야 합니다.
+#   sweep.py 가 sync_tensorboard=True 로 wandb 에 미러링하므로 그대로 사용 가능합니다.
+# ------------------------------------------------------------------
+
+program: legged_gym/scripts/sweep.py
+method: bayes            # grid | random | bayes
+
+metric:
+  name: "Train/mean_reward"
+  goal: maximize
+
+parameters:
+  # ----- PPO 알고리즘 하이퍼파라미터 (train_cfg.algorithm.*) -----
+  algorithm.learning_rate:
+    distribution: log_uniform_values
+    min: 0.00005
+    max: 0.003
+  algorithm.entropy_coef:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.05
+  algorithm.gamma:
+    values: [0.98, 0.99, 0.995]
+  algorithm.lam:
+    values: [0.9, 0.95, 0.99]
+  algorithm.clip_param:
+    values: [0.1, 0.2, 0.3]
+  algorithm.num_learning_epochs:
+    values: [3, 5, 8]
+  algorithm.num_mini_batches:
+    values: [4, 8]
+  algorithm.desired_kl:
+    values: [0.005, 0.01, 0.02]
+
+  # ----- 정책/러너 (train_cfg.policy.* / train_cfg.runner.*) -----
+  policy.init_noise_std:
+    values: [0.5, 1.0, 1.5]
+  runner.num_steps_per_env:
+    values: [24, 48]
+
+  # ----- 예시: 보상 스케일 튜닝 (env_cfg.rewards.scales.*) -----
+  # 필요 시 주석을 풀어 사용하세요.
+  # rewards.scales.tracking_lin_vel:
+  #   distribution: uniform
+  #   min: 1.0
+  #   max: 4.0
+  # rewards.scales.action_rate:
+  #   distribution: uniform
+  #   min: -0.02
+  #   max: -0.001
+
+# Bayes / 조기 종료(early stopping)로 가망 없는 run 을 빨리 정리하려면 주석 해제:
+# early_terminate:
+#   type: hyperband
+#   min_iter: 100
+#   eta: 3
